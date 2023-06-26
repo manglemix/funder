@@ -1,9 +1,13 @@
 #![feature(array_windows)]
 
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::Deserialize;
 use std::{
-    borrow::Cow,
-    collections::{hash_map::Entry, BinaryHeap, HashMap}, fmt::Display,
+    cmp::Ordering,
+    collections::{hash_map::Entry, BinaryHeap},
+    fmt::Display,
+    mem::take,
+    rc::Rc,
 };
 use toml::from_str;
 
@@ -14,38 +18,17 @@ pub struct Transaction {
     pub value: f64,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Copy, Debug)]
 pub struct InternationalCost {
-    pub to: String,
     pub conversion_loss: f64,
     pub fee: f64,
 }
 
 #[derive(Deserialize)]
-pub struct FinanceInformationDeser {
-    international_costs: HashMap<String, Vec<InternationalCost>>,
-    required_transactions: Vec<Transaction>,
-    people_locations: HashMap<String, String>,
-}
-
-pub struct Finance<'a> {
-    pub international_costs: HashMap<&'a str, Cow<'a, Vec<InternationalCost>>>,
-    pub required_transactions: Cow<'a, Vec<Transaction>>,
-    pub people_locations: Cow<'a, HashMap<String, String>>,
-}
-
-impl<'a> Finance<'a> {
-    pub fn from_deser(value: &'a FinanceInformationDeser) -> Self {
-        Self {
-            international_costs: value
-                .international_costs
-                .iter()
-                .map(|(text, value)| (text.as_str(), Cow::Borrowed(value)))
-                .collect(),
-            required_transactions: Cow::Borrowed(&value.required_transactions),
-            people_locations: Cow::Borrowed(&value.people_locations),
-        }
-    }
+pub struct Finance {
+    pub international_costs: HashMap<String, HashMap<String, InternationalCost>>,
+    pub required_transactions: HashMap<String, HashMap<String, Vec<f64>>>,
+    pub people_locations: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -55,34 +38,111 @@ pub enum SimplificationError<'a> {
 }
 
 #[derive(PartialEq, Debug)]
-struct QueueItem<'a> {
-    node: &'a str,
-    path: Vec<&'a str>,
-    current_value: f64,
-    losses: f64,
-    true_value: f64,
+struct NodeConnection<'a> {
+    from: Rc<Node<'a>>,
+    international_cost: Option<f64>,
 }
 
-impl<'a> Ord for QueueItem<'a> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.losses.partial_cmp(&self.losses).unwrap()
+#[derive(PartialEq, Debug)]
+struct Node<'a> {
+    item: &'a str,
+    chain_length: usize,
+    from: Option<NodeConnection<'a>>,
+    total_losses: f64,
+}
+
+impl<'a> Node<'a> {
+    fn new(item: &'a str) -> Rc<Self> {
+        Rc::new(Self {
+            item,
+            chain_length: 0,
+            from: None,
+            total_losses: 0.0,
+        })
+    }
+
+    fn extend_international<'b>(
+        self: &Rc<Self>,
+        item: &'a str,
+        value: f64,
+        international_cost: InternationalCost,
+    ) -> Rc<Self> {
+        let international_cost = (value + self.total_losses) * international_cost.conversion_loss
+            + international_cost.fee;
+        Rc::new(Self {
+            item,
+            chain_length: self.chain_length + 1,
+            from: Some(NodeConnection {
+                from: self.clone(),
+                international_cost: Some(international_cost),
+            }),
+            total_losses: self.total_losses + international_cost,
+        })
+    }
+
+    fn extend_international_no_fee<'b>(
+        self: &Rc<Self>,
+        item: &'a str,
+        value: f64,
+        international_cost: InternationalCost,
+    ) -> Rc<Self> {
+        let international_cost = (value + self.total_losses) * international_cost.conversion_loss;
+        Rc::new(Self {
+            item,
+            chain_length: self.chain_length + 1,
+            from: Some(NodeConnection {
+                from: self.clone(),
+                international_cost: Some(international_cost),
+            }),
+            total_losses: self.total_losses + international_cost,
+        })
+    }
+
+    fn extend<'b>(self: &Rc<Self>, item: &'a str) -> Rc<Self> {
+        Rc::new(Self {
+            item,
+            chain_length: self.chain_length + 1,
+            from: Some(NodeConnection {
+                from: self.clone(),
+                international_cost: None,
+            }),
+            total_losses: self.total_losses,
+        })
+    }
+
+    fn chain_contains(self: &Rc<Self>, item: &str) -> bool {
+        if self.item == item {
+            return true;
+        }
+        self.from
+            .as_ref()
+            .map(|conn| conn.from.chain_contains(item))
+            .unwrap_or_default()
     }
 }
 
-impl<'a> PartialOrd for QueueItem<'a> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+impl<'a> Ord for Node<'a> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match other.total_losses.partial_cmp(&self.total_losses).unwrap() {
+            Ordering::Equal => other.chain_length.cmp(&self.chain_length),
+            ord => ord,
+        }
+    }
+}
+
+impl<'a> PartialOrd for Node<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'a> Eq for QueueItem<'a> {}
+impl<'a> Eq for Node<'a> {}
 
 #[derive(Debug)]
 pub struct SimplifiedTransactions {
     pub transactions: Vec<Transaction>,
-    pub total_losses: f64
+    pub total_losses: f64,
 }
-
 
 impl Display for SimplifiedTransactions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -94,217 +154,160 @@ impl Display for SimplifiedTransactions {
     }
 }
 
-
-impl<'a> Finance<'a> {
+impl Finance {
     pub fn simplify_transactions(&self) -> Result<SimplifiedTransactions, SimplificationError> {
-        let mut people_transactions: HashMap<(&str, &str), f64> = HashMap::new();
-
-        for tx in self.required_transactions.iter() {
-            let key = (tx.from.as_str(), tx.to.as_str());
-            if let Some(mutref) = people_transactions.get_mut(&key) {
-                *mutref += tx.value;
-            } else if let Some(mutref) =
-                people_transactions.get_mut(&(tx.to.as_str(), tx.from.as_str()))
-            {
-                *mutref -= tx.value
-            } else {
-                people_transactions.insert(key, tx.value);
-            }
-        }
-
-        people_transactions = people_transactions
-            .into_iter()
-            .map(|((from, to), value)| {
-                if value < 0.0 {
-                    ((to, from), -value)
-                } else {
-                    ((from, to), value)
-                }
+        let mut simplified_required_transactions: HashMap<_, f64> = self
+            .required_transactions
+            .iter()
+            .map(|(from, to_map)| {
+                to_map
+                        .iter()
+                        .map(|(to, values)|
+                        ((from.as_str(), to.as_str()), values.iter().sum()))
             })
+            .flatten()
             .collect();
 
-        println!("{people_transactions:?}");
-        let mut country_transactions: HashMap<(&str, &str), f64> = HashMap::new();
-
-        for ((from, to), value) in &people_transactions {
-            let Some(from) = self.people_locations.get(*from) else {
-                return Err(SimplificationError::MissingLocation { person: from })
-            };
-            let Some(to) = self.people_locations.get(*to) else {
-                return Err(SimplificationError::MissingLocation { person: to })
-            };
-            if from == to {
-                // todo
-                continue;
-            }
-            let key = (from.as_str(), to.as_str());
-            if let Some(mutref) = country_transactions.get_mut(&key) {
-                *mutref += value;
-            } else if let Some(mutref) = country_transactions.get_mut(&(to.as_str(), from.as_str()))
-            {
-                *mutref -= value
-            } else {
-                country_transactions.insert(key, *value);
-            }
-        }
-
-        country_transactions = country_transactions
+        take(&mut simplified_required_transactions)
             .into_iter()
-            .map(|((from, to), value)| {
-                if value < 0.0 {
-                    ((to, from), -value)
-                } else {
-                    ((from, to), value)
+            .for_each(|((from, to), value)| 
+                match simplified_required_transactions.entry((from, to)) {
+                    Entry::Occupied(mut current_value) => *current_value.get_mut() += value,
+
+                    Entry::Vacant(_) => match simplified_required_transactions.entry((to, from)) {
+                        Entry::Occupied(mut current_value) => *current_value.get_mut() -= value,
+
+                        Entry::Vacant(entry) => {
+                            entry.insert(- value);
+                        }
+                    }
                 }
-            })
-            .collect();
-
-        println!("{country_transactions:?}");
-
-        let mut country_transaction_paths = vec![];
-
-        for ((from, to), value) in country_transactions {
-            let mut priority_queue = BinaryHeap::new();
-            priority_queue.push(QueueItem {
-                node: from,
-                path: vec![],
-                current_value: value,
-                losses: 0.0,
-                true_value: value,
-            });
-
-            let mut final_item = None;
-
-            while let Some(item) = priority_queue.pop() {
-                if item.node == to {
-                    final_item = Some(item);
-                    break;
-                }
-
-                let Some(successors) = self.international_costs.get(item.node) else {
-                    continue
-                };
-                let mut path = item.path.clone();
-                path.push(item.node);
-
-                for successor_cost in successors.iter() {
-                    let conversion_loss = item.current_value * successor_cost.conversion_loss;
-
-                    let current_value = item.current_value + conversion_loss;
-                    let losses = item.losses + conversion_loss + successor_cost.fee;
-
-                    priority_queue.push(QueueItem {
-                        node: &successor_cost.to,
-                        path: path.clone(),
-                        current_value,
-                        losses,
-                        true_value: value,
-                    })
-                }
-            }
-
-            let Some(final_item) = final_item else {
-                return Err(SimplificationError::NoSolution { from, to })
-            };
-
-            country_transaction_paths.push(final_item);
-        }
+            );
 
         let mut total_losses = 0.0;
-        country_transactions = HashMap::new();
-        for item in country_transaction_paths {
-            let mut path = item.path;
-            path.push(item.node);
-            total_losses += item.losses;
+        let mut existing_international_segments: HashSet<(&str, &str)> = HashSet::default();
+        let mut country_people_map: HashMap<&str, Vec<&str>> = HashMap::default();
 
-            for [from, to] in path.array_windows::<2>() {
-                let key = (*from, *to);
-                if let Some(mutref) = country_transactions.get_mut(&key) {
-                    *mutref += item.true_value;
-                } else if let Some(mutref) = country_transactions.get_mut(&(*to, *from)) {
-                    *mutref -= item.true_value;
-                } else {
-                    country_transactions.insert(key, item.true_value);
-                }
-            }
-        }
-
-        country_transactions = country_transactions
-            .into_iter()
-            .map(|((from, to), value)| {
-                if value < 0.0 {
-                    ((to, from), -value)
-                } else {
-                    ((from, to), value)
-                }
-            })
-            .collect();
-
-        println!("{country_transactions:?}");
-
-        let mut country_people_map: HashMap<&str, Vec<&str>> = HashMap::new();
-        for (person, country) in self.people_locations.iter() {
-            match country_people_map.entry(country.as_str()) {
-                Entry::Occupied(mut entry) => entry.get_mut().push(person.as_str()),
+        self.people_locations.iter().for_each(|(person, country)| {
+            match country_people_map.entry(country) {
+                Entry::Occupied(mut entry) => entry.get_mut().push(person),
                 Entry::Vacant(entry) => {
-                    entry.insert(vec![person.as_str()]);
+                    entry.insert(vec![person]);
                 }
             }
+        });
+
+        'outer: for ((mut from, mut to), mut value) in take(&mut simplified_required_transactions) {
+            if value < 0.0 {
+                let tmp = from;
+                from = to;
+                to = tmp;
+                value *= -1.0;
+            }
+
+            let mut priority_queue = BinaryHeap::new();
+            priority_queue.push(Node::new(from));
+
+            while let Some(node) = priority_queue.pop() {
+                if node.item == to {
+                    let mut running_cost = 0.0;
+                    let mut node = node;
+                    loop {
+                        let Some(connection) = node.from.as_ref() else {
+                            break
+                        };
+                        let from = connection.from.item;
+                        let to = node.item;
+                        let value = value + running_cost;
+
+                        match simplified_required_transactions.entry((from, to)) {
+                            Entry::Occupied(mut current_value) => *current_value.get_mut() += value,
+        
+                            Entry::Vacant(_) => match simplified_required_transactions.entry((to, from)) {
+                                Entry::Occupied(mut current_value) => *current_value.get_mut() -= value,
+        
+                                Entry::Vacant(entry) => {
+                                    entry.insert(- value);
+                                }
+                            }
+                        }
+                        if let Some(cost) = connection.international_cost.clone() {
+                            existing_international_segments.insert((from, to));
+                            total_losses += cost;
+                            running_cost += cost;
+                        }
+                        node = connection.from.clone();
+                    }
+                    continue 'outer;
+                }
+
+                let Some(location) = self.people_locations.get(node.item) else {
+                    return Err(SimplificationError::MissingLocation { person: node.item })
+                };
+
+                country_people_map
+                    .get(location.as_str())
+                    .unwrap()
+                    .iter()
+                    .for_each(|other| {
+                        if !node.chain_contains(other) {
+                            priority_queue.push(node.extend(other));
+                        }
+                    });
+
+                let Some(successors) = self.international_costs.get(location) else {
+                    continue
+                };
+
+                successors
+                    .iter()
+                    .for_each(|(successor, international_cost)| {
+                        country_people_map
+                            .get(successor.as_str())
+                            .unwrap()
+                            .iter()
+                            .for_each(|other| 
+                                if existing_international_segments.contains(&(node.item, *other)) || existing_international_segments.contains(&(*other, node.item)){
+                                    priority_queue.push(node.extend_international_no_fee(
+                                        other,
+                                        value,
+                                        *international_cost,
+                                    ));
+                                } else if !node.chain_contains(other) {
+                                    priority_queue.push(node.extend_international(
+                                        other,
+                                        value,
+                                        *international_cost,
+                                    ));
+                                }
+                            )
+                    });
+            }
+
+            return Err(SimplificationError::NoSolution { from, to });
         }
 
-        let transactions = country_transactions
-            .into_iter()
-            .map(|((from, to), value)| {
-                let from = country_people_map
-                    .get(from)
-                    .unwrap()
-                    .get(0)
-                    .unwrap()
-                    .to_string();
-                let to = country_people_map
-                    .get(to)
-                    .unwrap()
-                    .get(0)
-                    .unwrap()
-                    .to_string();
-                Transaction { from, to, value }
-            })
-            .chain(
-                country_people_map
-                    .iter()
-                    .map(
-                        |(_, people)| {
-                            people
-                                .iter()
-                                .skip(1)
-                                .map(|person| {
-                                    let value: f64 = people_transactions
-                                        .iter()
-                                        .map(|((from, to), value)| {
-                                            if from == person {
-                                                *value
-                                            } else if to == person {
-                                                - value
-                                            } else {
-                                                0.0
-                                            }
-                                        })
-                                        .sum();
-
-                                    if value < 0.0 {
-                                        Transaction { from: people.get(0).unwrap().to_string(), to: person.to_string(), value: - value }
-                                    } else {
-                                        Transaction { to: people.get(0).unwrap().to_string(), from: person.to_string(), value }
-                                    }
-                                })
-                            
+        Ok(SimplifiedTransactions {
+            transactions: simplified_required_transactions
+                .into_iter()
+                .map(|((from, to), value)| {
+                    if value < 0.0 {
+                        Transaction {
+                            to: from.into(),
+                            from: to.into(),
+                            value: -value,
                         }
-                    )
-                    .flatten()
-            )
-            .collect::<Vec<_>>();
-
-        Ok(SimplifiedTransactions { transactions, total_losses })
+                    } else {
+                        Transaction {
+                            from: from.into(),
+                            to: to.into(),
+                            value,
+                        }
+                    }
+                })
+                .collect(),
+            total_losses,
+        })
     }
 }
 
@@ -317,15 +320,13 @@ fn main() {
         }
     };
 
-    let finance: FinanceInformationDeser = match from_str(&text) {
+    let finance: Finance = match from_str(&text) {
         Ok(x) => x,
         Err(e) => {
             println!("Faced the following toml error: {e:?}");
             return;
         }
     };
-
-    let finance = Finance::from_deser(&finance);
 
     match finance.simplify_transactions() {
         Ok(ans) => {

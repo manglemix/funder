@@ -8,4 +8,4 @@ edition = "2021"
 [dependencies]
 toml = "*"
 serde = { version = "*", features = ["derive"] }
-# pathfinding = "*"
+fxhash = "*"
